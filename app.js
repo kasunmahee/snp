@@ -84,17 +84,31 @@ const dashboard = {
             document.getElementById('dash-total-sales').textContent = utils.formatCurrency(totalSales);
 
             // Recent Transactions
-            const { data: recentBills } = await supaClient.from('bills').select('*, shops(*)').order('date', { ascending: false }).limit(5);
+            const { data: allRecentBills } = await supaClient.from('bills').select('*, shops(*)').order('date', { ascending: false }).limit(50);
             const listEl = document.getElementById('dash-recent-list');
             listEl.innerHTML = '';
 
+            let recentBills = [];
+            if (allRecentBills) {
+                recentBills = allRecentBills.slice(0, 5); // Take top 5
+            }
+
             if (!recentBills || recentBills.length === 0) {
-                listEl.innerHTML = '<div class="text-center py-8 text-gray-400 text-sm">No transactions yet</div>';
+                listEl.innerHTML = '<div class="text-center py-8 text-gray-400 text-sm">No pending transactions yet</div>';
                 return;
             }
 
             for (const bill of recentBills) {
                 const shop = bill.shops;
+                
+                const paid = bill.paidAmount || 0;
+                const isPaid = paid >= (bill.totalCost || 0);
+                const statusBadge = isPaid 
+                    ? `<span class="bg-green-100 text-green-700 text-[10px] px-2 py-0.5 rounded-full font-bold ml-2">PAID</span>`
+                    : paid > 0 
+                        ? `<span class="bg-yellow-100 text-yellow-700 text-[10px] px-2 py-0.5 rounded-full font-bold ml-2">PARTIAL</span>`
+                        : `<span class="bg-red-100 text-red-700 text-[10px] px-2 py-0.5 rounded-full font-bold ml-2">UNPAID</span>`;
+                
                 const div = document.createElement('div');
                 div.className = 'bg-white p-3 rounded-xl border border-gray-100 flex justify-between items-center cursor-pointer hover:bg-gray-50 transition';
                 div.onclick = () => billViewer.open(bill.id);
@@ -104,11 +118,11 @@ const dashboard = {
                             <i data-lucide="receipt" class="w-4 h-4"></i>
                         </div>
                         <div>
-                            <div class="font-semibold text-sm text-gray-900">${shop ? shop.name : 'Unknown Shop'}</div>
+                            <div class="font-semibold text-sm text-gray-900 flex items-center">${shop ? shop.name : 'Unknown Shop'} ${statusBadge}</div>
                             <div class="text-xs text-gray-500">${new Date(bill.date).toLocaleDateString()}</div>
                         </div>
                     </div>
-                    <div class="font-bold text-gray-900">${utils.formatCurrency(bill.totalAmount)}</div>
+                    <div class="font-bold text-gray-900">${utils.formatCurrency(bill.totalCost || 0)}</div>
                 `;
                 listEl.appendChild(div);
             }
@@ -466,7 +480,7 @@ const billViewer = {
             // Populate Modal
             document.getElementById('bill-modal-shop').textContent = shop ? shop.name : 'Unknown Shop';
             document.getElementById('bill-modal-date').textContent = new Date(bill.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
-            document.getElementById('bill-modal-total').textContent = utils.formatCurrency(bill.totalAmount);
+            document.getElementById('bill-modal-total').textContent = utils.formatCurrency(bill.totalCost || 0);
 
             // Add Download & Delete Buttons
             const headerAction = document.getElementById('bill-modal-action');
@@ -502,9 +516,15 @@ const billViewer = {
                 }
             }
 
-            // Show Cost
-            const costEl = document.getElementById('bill-modal-cost');
-            if (costEl) costEl.textContent = bill.totalCost !== undefined && bill.totalCost !== null ? utils.formatCurrency(bill.totalCost) : 'N/A';
+            // Calculate paid and balance
+            const paid = bill.paidAmount || 0;
+            const balance = (bill.totalCost || 0) - paid;
+
+            const paidEl = document.getElementById('bill-modal-paid');
+            if (paidEl) paidEl.textContent = utils.formatCurrency(paid);
+
+            const balanceEl = document.getElementById('bill-modal-balance');
+            if (balanceEl) balanceEl.textContent = utils.formatCurrency(balance);
 
             const listEl = document.getElementById('bill-modal-items');
             listEl.innerHTML = '';
@@ -513,6 +533,8 @@ const billViewer = {
                 items.forEach(item => {
                     const prod = productsMap.get(item.productId);
                     const name = prod ? prod.name : 'Unknown Product';
+                    item._name = name; // saved for payment module
+
                     const div = document.createElement('div');
                     div.className = 'flex justify-between items-center text-sm border-b border-gray-50 pb-2 last:border-0';
                     div.innerHTML = `
@@ -531,6 +553,28 @@ const billViewer = {
                     `;
                     listEl.appendChild(div);
                 });
+            }
+
+            // Payment Options Button
+            const paymentBtn = document.getElementById('bill-modal-payment-btn');
+            if (paymentBtn) {
+                if (balance <= 0) {
+                    paymentBtn.classList.add('opacity-50', 'cursor-not-allowed');
+                    paymentBtn.onclick = () => utils.toast('Bill is fully paid!', 'success');
+                } else {
+                    paymentBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    paymentBtn.onclick = () => {
+                        paymentModule.open(bill.id, bill.totalCost || 0, paid, items);
+                    };
+                }
+            }
+
+            // Payment History Button
+            const historyBtn = document.getElementById('bill-modal-payment-history-btn');
+            if (historyBtn) {
+                historyBtn.onclick = () => {
+                    paymentHistoryModule.open(bill.id);
+                };
             }
 
             lucide.createIcons();
@@ -654,6 +698,269 @@ const billViewer = {
     }
 };
 
+// Payment Module
+const paymentModule = {
+    state: {
+        billId: null,
+        total: 0,
+        paid: 0,
+        balance: 0,
+        activeTab: 'amount',
+        method: 'Cash',
+        itemsSelectedAmount: 0,
+        selectedItems: []
+    },
+    
+    open: async (billId, total, paid, items) => {
+        paymentModule.state.billId = billId;
+        paymentModule.state.total = total || 0;
+        paymentModule.state.paid = paid || 0;
+        paymentModule.state.balance = total - (paid || 0);
+
+        if (paymentModule.state.balance <= 0) {
+            return utils.toast('This bill is already fully paid.', 'success');
+        }
+
+        document.getElementById('payment-modal-due').textContent = utils.formatCurrency(paymentModule.state.balance);
+        document.getElementById('payment-modal-total').textContent = utils.formatCurrency(paymentModule.state.total);
+        
+        // Reset Inputs
+        document.getElementById('payment-input-amount').value = '';
+        paymentModule.state.itemsSelectedAmount = 0;
+        paymentModule.state.selectedItems = [];
+        document.getElementById('payment-items-total').textContent = utils.formatCurrency(0);
+
+        // Populate Items for Item-Wise View
+        const listEl = document.getElementById('payment-items-list');
+        listEl.innerHTML = '';
+        
+        items.forEach((item) => {
+            const div = document.createElement('div');
+            div.className = 'flex justify-between items-center bg-white p-2 rounded border border-gray-100';
+            const itemTotal = item.quantity * (item.costAtTime || 0);
+            div.innerHTML = `
+                <label class="flex items-center gap-3 cursor-pointer flex-1">
+                    <input type="checkbox" class="w-4 h-4 text-blue-600 rounded focus:ring-blue-500" 
+                        onchange="paymentModule.toggleItem(this, ${itemTotal}, ${item.id})">
+                    <div>
+                        <div class="text-sm font-medium text-gray-800">${item._name || 'Item'} (x${item.quantity})</div>
+                        <div class="text-xs text-gray-500">Cost: ${utils.formatCurrency(item.costAtTime || 0)} each</div>
+                    </div>
+                </label>
+                <div class="font-semibold text-gray-700 text-sm">${utils.formatCurrency(itemTotal)}</div>
+            `;
+            listEl.appendChild(div);
+        });
+
+        // Reset Method to Cash
+        const btns = document.querySelectorAll('.payment-method-btn');
+        if(btns.length > 0) paymentModule.setMethod('Cash', btns[0]);
+
+        paymentModule.switchTab('amount');
+        openModal('payment-modal');
+    },
+
+    switchTab: (tab) => {
+        paymentModule.state.activeTab = tab;
+        const btnAmount = document.getElementById('tab-btn-amount');
+        const btnItems = document.getElementById('tab-btn-items');
+        const viewAmount = document.getElementById('payment-tab-amount');
+        const viewItems = document.getElementById('payment-tab-items');
+
+        if (tab === 'amount') {
+            btnAmount.className = "flex-1 py-2 text-sm font-semibold text-blue-600 border-b-2 border-blue-600";
+            btnItems.className = "flex-1 py-2 text-sm font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-700";
+            viewAmount.classList.remove('hidden');
+            viewItems.classList.add('hidden');
+        } else {
+            btnItems.className = "flex-1 py-2 text-sm font-semibold text-blue-600 border-b-2 border-blue-600";
+            btnAmount.className = "flex-1 py-2 text-sm font-semibold text-gray-500 border-b-2 border-transparent hover:text-gray-700";
+            viewItems.classList.remove('hidden');
+            viewAmount.classList.add('hidden');
+        }
+    },
+
+    toggleItem: (checkbox, amount, itemId) => {
+        if (checkbox.checked) {
+            paymentModule.state.itemsSelectedAmount += amount;
+            paymentModule.state.selectedItems.push(itemId);
+        } else {
+            paymentModule.state.itemsSelectedAmount -= amount;
+            paymentModule.state.selectedItems = paymentModule.state.selectedItems.filter(id => id !== itemId);
+        }
+        document.getElementById('payment-items-total').textContent = utils.formatCurrency(paymentModule.state.itemsSelectedAmount);
+    },
+
+    setMethod: (method, btnElem) => {
+        paymentModule.state.method = method;
+        document.querySelectorAll('.payment-method-btn').forEach(btn => {
+            btn.className = "payment-method-btn bg-gray-50 border-gray-200 text-gray-600 border rounded-lg py-2 text-sm font-semibold hover:bg-gray-100 transition";
+        });
+        btnElem.className = "payment-method-btn active bg-blue-50 border-blue-200 text-blue-700 border rounded-lg py-2 text-sm font-semibold transition";
+    },
+
+    save: async () => {
+        let payAmount = 0;
+        let itemsPaidJson = null;
+
+        if (paymentModule.state.activeTab === 'amount') {
+            payAmount = parseFloat(document.getElementById('payment-input-amount').value) || 0;
+        } else {
+            payAmount = paymentModule.state.itemsSelectedAmount;
+            itemsPaidJson = paymentModule.state.selectedItems; 
+        }
+
+        if (payAmount <= 0) return utils.toast('Please select items or enter a valid amount to pay.', 'error');
+        if (payAmount > paymentModule.state.balance) {
+            return utils.toast('Amount exceeds the balance due: ' + utils.formatCurrency(paymentModule.state.balance), 'error');
+        }
+
+        try {
+            // 1. Insert into payments table
+            const { error: payError } = await supaClient.from('payments').insert({
+                billId: paymentModule.state.billId,
+                amount: payAmount,
+                method: paymentModule.state.method,
+                itemsPaid: itemsPaidJson
+            });
+
+            if (payError) throw payError;
+
+            // 2. Update bills table paidAmount
+            const newPaidTotal = paymentModule.state.paid + payAmount;
+            const { error: billError } = await supaClient.from('bills').update({
+                paidAmount: newPaidTotal
+            }).eq('id', paymentModule.state.billId);
+
+            if (billError) throw billError;
+
+            utils.toast('Payment saved successfully!', 'success');
+            closeModal('payment-modal');
+
+            // Refresh UI
+            billViewer.open(paymentModule.state.billId);
+            if (!document.getElementById('view-dashboard').classList.contains('hidden')) dashboard.load();
+            if (!document.getElementById('view-history').classList.contains('hidden')) historyView.renderList();
+
+        } catch(e) {
+            console.error(e);
+            utils.toast('Error saving payment. Check network or DB.', 'error');
+        }
+    }
+};
+
+// Payment History Module
+const paymentHistoryModule = {
+    state: {
+        billId: null,
+        payments: [],
+        bill: null
+    },
+    open: async (billId) => {
+        paymentHistoryModule.state.billId = billId;
+        const listEl = document.getElementById('payment-history-list');
+        listEl.innerHTML = '<div class="text-center text-gray-400 text-sm py-8">Loading history...</div>';
+        
+        openModal('payment-history-modal');
+
+        try {
+            const { data: bill } = await supaClient.from('bills').select('*').eq('id', billId).single();
+            const { data: payments } = await supaClient.from('payments').select('*').eq('billId', billId).order('date', { ascending: false });
+            
+            paymentHistoryModule.state.bill = bill;
+            paymentHistoryModule.state.payments = payments || [];
+            
+            if (!payments || payments.length === 0) {
+                listEl.innerHTML = '<div class="text-center text-gray-400 text-sm py-8">No payments recorded yet.</div>';
+                document.getElementById('payment-history-summary').textContent = `Total Cost: ${utils.formatCurrency(bill.totalCost || 0)} | Paid: 0.00`;
+                return;
+            }
+
+            listEl.innerHTML = '';
+            let totalFetchedPaid = 0;
+
+            payments.forEach(p => {
+                totalFetchedPaid += p.amount;
+                const div = document.createElement('div');
+                div.className = 'bg-white p-3 rounded-lg border border-gray-100 flex justify-between items-center';
+                div.innerHTML = `
+                    <div>
+                        <div class="font-bold text-gray-800 text-sm">${utils.formatCurrency(p.amount)}</div>
+                        <div class="text-xs text-gray-500 mt-1 flex items-center gap-2">
+                            <span class="bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded text-[10px] font-semibold tracking-wider uppercase">${p.method}</span>
+                            ${new Date(p.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}
+                        </div>
+                    </div>
+                `;
+                listEl.appendChild(div);
+            });
+
+            document.getElementById('payment-history-summary').textContent = `Total Cost: ${utils.formatCurrency(bill.totalCost || 0)} | Total Paid: ${utils.formatCurrency(totalFetchedPaid)}`;
+
+            // Setup download button
+            const dlBtn = document.getElementById('phistory-download-btn');
+            if (dlBtn) dlBtn.onclick = () => paymentHistoryModule.downloadPDF();
+
+        } catch (e) {
+            console.error(e);
+            listEl.innerHTML = '<div class="text-center text-red-400 text-sm py-8">Failed to load history</div>';
+        }
+    },
+    downloadPDF: async () => {
+        try {
+            if (!window.jspdf) return utils.toast('PDF Library not loaded', 'error');
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF();
+            
+            const bill = paymentHistoryModule.state.bill;
+            const payments = paymentHistoryModule.state.payments;
+            if (!payments || payments.length === 0) return utils.toast('No payments to export', 'error');
+
+            const { data: shop } = await supaClient.from('shops').select('*').eq('id', bill.shopId).single();
+
+            // Header
+            doc.setFontSize(18);
+            doc.text("S&P Product - Payment History", 105, 15, null, null, "center");
+
+            doc.setFontSize(10);
+            doc.text(`Shop: ${shop ? shop.name : 'Unknown Shop'}`, 14, 25);
+            doc.text(`Bill ID: #${bill.id}`, 14, 30);
+            doc.text(`Bill Date: ${new Date(bill.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}`, 14, 35);
+            doc.text(`Total Cost: Rs ${parseFloat(bill.totalCost || 0).toFixed(2)}`, 14, 40);
+
+            const body = payments.map(p => [
+                new Date(p.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' }),
+                p.method,
+                parseFloat(p.amount).toFixed(2)
+            ]);
+
+            doc.autoTable({
+                head: [['Date', 'Method', 'Amount Paid']],
+                body: body,
+                startY: 45,
+                theme: 'striped',
+                headStyles: { fillColor: [37, 99, 235] }
+            });
+
+            const finalY = doc.lastAutoTable.finalY + 10;
+            const totalPaid = payments.reduce((sum, p) => sum + p.amount, 0);
+
+            doc.setFontSize(12);
+            doc.setFont(undefined, 'bold');
+            doc.text(`Total Paid: Rs ${totalPaid.toFixed(2)}`, 195, finalY, null, null, "right");
+            
+            const balance = (bill.totalCost || 0) - totalPaid;
+            doc.setFont(undefined, 'normal');
+            doc.text(`Remaining Balance: Rs ${balance.toFixed(2)}`, 195, finalY + 7, null, null, "right");
+
+            doc.save(`Payment_History_Bill_${bill.id}.pdf`);
+        } catch (e) {
+            console.error(e);
+            utils.toast('Failed to generate PDF', 'error');
+        }
+    }
+};
+
 // History Module
 const historyView = {
     loadFilters: async () => {
@@ -742,18 +1049,26 @@ const historyView = {
 
             for (const bill of bills) {
                 const shop = shopMap.get(bill.shopId);
+                
+                const paid = bill.paidAmount || 0;
+                const isPaid = paid >= (bill.totalCost || 0);
+                const statusBadge = isPaid 
+                    ? `<span class="bg-green-100 text-green-700 text-[10px] px-2 py-0.5 rounded-full font-bold ml-2">PAID</span>`
+                    : paid > 0 
+                        ? `<span class="bg-yellow-100 text-yellow-700 text-[10px] px-2 py-0.5 rounded-full font-bold ml-2">PARTIAL</span>`
+                        : `<span class="bg-red-100 text-red-700 text-[10px] px-2 py-0.5 rounded-full font-bold ml-2">UNPAID</span>`;
+                
                 const div = document.createElement('div');
                 div.className = 'bg-white p-4 rounded-xl shadow-sm border border-gray-100 cursor-pointer hover:bg-gray-50 transition';
                 div.onclick = () => billViewer.open(bill.id);
                 div.innerHTML = `
                     <div class="flex justify-between items-start mb-2">
                         <div>
-                            <h4 class="font-bold text-gray-800">${shop ? shop.name : 'Unknown Shop'}</h4>
-                            <p class="text-xs text-gray-500">${new Date(bill.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</p>
+                            <h4 class="font-bold text-gray-800 flex items-center">${shop ? shop.name : 'Unknown Shop'} ${statusBadge}</h4>
+                            <p class="text-xs text-gray-500 mt-1">${new Date(bill.date).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}</p>
                         </div>
                         <div class="text-right">
-                            <span class="block font-bold text-green-600 bg-green-50 px-2 py-1 rounded-lg text-sm">${utils.formatCurrency(bill.totalAmount)}</span>
-                            ${bill.totalCost !== undefined && bill.totalCost !== null ? `<span class="block text-xs text-gray-400 mt-1">Cost: ${utils.formatCurrency(bill.totalCost)}</span>` : ''}
+                            <span class="block font-bold text-green-600 bg-green-50 px-2 py-1 rounded-lg text-sm">${utils.formatCurrency(bill.totalCost || 0)}</span>
                         </div>
                     </div>
                     <div class="text-xs text-gray-400">Bill ID: #${bill.id}</div>
