@@ -10,7 +10,8 @@ const appState = {
     auth: {
         isLoggedIn: localStorage.getItem('isLoggedIn') === 'true',
         user: localStorage.getItem('loggedUser') || null
-    }
+    },
+    billingProducts: []
 };
 
 // Auth Module
@@ -372,10 +373,6 @@ const products = {
 // Billing Module
 const billing = {
     init: async () => {
-        // Reset Cart
-        appState.cart = [];
-        billing.renderCart();
-
         try {
             // Load Shops
             const { data: shopList } = await supaClient.from('shops').select('*').order('name');
@@ -390,101 +387,121 @@ const billing = {
                 });
             }
 
-            // Load Products
+            // Load Products for selection table
             const { data: prodList } = await supaClient.from('products').select('*').order('name');
-            const prodSelect = document.getElementById('billing-product-select');
-            prodSelect.innerHTML = '<option value="">Select Product...</option>';
-            if (prodList) {
-                prodList.forEach(p => {
-                    const opt = document.createElement('option');
-                    opt.value = p.id;
-                    opt.textContent = `${p.name} (Rs ${p.sellingPrice})`;
-                    opt.dataset.price = p.sellingPrice;
-                    opt.dataset.cost = p.costPrice; // track cost
-                    opt.dataset.name = p.name;
-                    prodSelect.appendChild(opt);
-                });
-            }
+            appState.billingProducts = (prodList || []).map(p => ({
+                id: p.id,
+                name: p.name,
+                price: p.sellingPrice,
+                cost: p.costPrice,
+                selected: false,
+                quantity: 0
+            }));
+
+            // Clear search and render
+            const searchInput = document.getElementById('billing-product-search');
+            if (searchInput) searchInput.value = '';
+            
+            billing.renderTable();
+            billing.calculateTotal();
         } catch (e) {
             console.error(e);
         }
     },
+
+    renderTable: () => {
+        const container = document.getElementById('billing-products-table-body');
+        const searchTerm = (document.getElementById('billing-product-search')?.value || '').toLowerCase();
+        
+        container.innerHTML = '';
+        
+        const filtered = appState.billingProducts.filter(p => 
+            p.name.toLowerCase().includes(searchTerm)
+        );
+
+        if (filtered.length === 0) {
+            container.innerHTML = '<tr><td colspan="4" class="text-center py-4 text-gray-400">No products match search</td></tr>';
+            return;
+        }
+
+        filtered.forEach(p => {
+            const tr = document.createElement('tr');
+            tr.className = `transition-colors ${p.selected ? 'bg-blue-50/50' : 'hover:bg-gray-50/50'}`;
+            tr.innerHTML = `
+                <td class="px-3 py-3 w-8">
+                    <div class="flex items-center justify-center">
+                        <input type="checkbox" ${p.selected ? 'checked' : ''} 
+                            onchange="billing.handleUpdate(${p.id}, 'select', this.checked)"
+                            class="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500 transition cursor-pointer">
+                    </div>
+                </td>
+                <td class="px-2 py-3">
+                    <span class="block font-medium text-gray-800">${p.name}</span>
+                    <span class="text-[10px] text-gray-400">ID: #${p.id}</span>
+                </td>
+                <td class="px-2 py-3 text-right font-bold text-gray-700">
+                    Rs ${p.price}
+                </td>
+                <td class="px-2 py-3 text-center">
+                    <input type="number" value="${p.quantity || ''}" 
+                        oninput="billing.handleUpdate(${p.id}, 'quantity', this.value)"
+                        class="w-16 bg-gray-50 border border-gray-200 rounded-lg py-1 px-2 text-center text-sm outline-none focus:ring-2 focus:ring-blue-500 transition-all ${p.selected ? 'bg-white font-bold' : 'opacity-50'}"
+                        placeholder="0">
+                </td>
+            `;
+            container.appendChild(tr);
+        });
+        
+        lucide.createIcons();
+    },
+
+    handleUpdate: (id, type, value) => {
+        const item = appState.billingProducts.find(p => p.id === id);
+        if (!item) return;
+
+        if (type === 'select') {
+            item.selected = value;
+            // If selected, set qty to 1 if it was 0
+            if (value && (item.quantity === 0 || !item.quantity)) {
+                item.quantity = 1;
+            }
+        } else if (type === 'quantity') {
+            item.quantity = parseInt(value) || 0;
+            // If qty > 0, auto-select
+            if (item.quantity > 0) item.selected = true;
+            else if (item.quantity === 0) item.selected = false;
+        }
+
+        billing.renderTable();
+        billing.calculateTotal();
+    },
+
+    calculateTotal: () => {
+        const selected = appState.billingProducts.filter(p => p.selected && p.quantity > 0);
+        const grandTotal = selected.reduce((sum, p) => sum + (p.price * p.quantity), 0);
+        
+        document.getElementById('billing-total-display').textContent = utils.formatCurrency(grandTotal);
+        
+        const badge = document.getElementById('selected-count-badge');
+        if (badge) {
+            badge.textContent = `${selected.length} ITEM${selected.length !== 1 ? 'S' : ''} SELECTED`;
+        }
+    },
+
     startWithShop: async (shopId) => {
         await router.navigate('billing');
         document.getElementById('billing-shop-select').value = shopId;
     },
-    addItem: () => {
-        const prodSelect = document.getElementById('billing-product-select');
-        const qtyInput = document.getElementById('billing-qty');
 
-        const productId = parseInt(prodSelect.value);
-        const qty = parseInt(qtyInput.value);
-
-        if (!productId || !qty || qty <= 0) return utils.toast('Select valid product and quantity', 'error');
-
-        const price = parseFloat(prodSelect.options[prodSelect.selectedIndex].dataset.price);
-        const cost = parseFloat(prodSelect.options[prodSelect.selectedIndex].dataset.cost) || 0;
-        const name = prodSelect.options[prodSelect.selectedIndex].dataset.name;
-
-        // Check if exists
-        const existing = appState.cart.find(i => i.productId === productId);
-        if (existing) {
-            existing.quantity += qty;
-        } else {
-            appState.cart.push({
-                productId,
-                name,
-                price,
-                cost,
-                quantity: qty,
-                total: price * qty
-            });
-        }
-
-        // Reset inputs
-        qtyInput.value = '';
-        prodSelect.value = '';
-
-        billing.renderCart();
-    },
-    removeItem: (index) => {
-        appState.cart.splice(index, 1);
-        billing.renderCart();
-    },
-    renderCart: () => {
-        const container = document.getElementById('billing-cart-list');
-        container.innerHTML = '';
-        let grandTotal = 0;
-
-        appState.cart.forEach((item, index) => {
-            const lineTotal = item.price * item.quantity;
-            grandTotal += lineTotal;
-
-            const div = document.createElement('div');
-            div.className = 'bg-white p-3 rounded-lg border border-gray-100 flex justify-between items-center text-sm';
-            div.innerHTML = `
-                <div class="flex-1">
-                    <div class="font-medium text-gray-800">${item.name}</div>
-                    <div class="text-xs text-gray-500">${item.quantity} x Rs ${item.price}</div>
-                </div>
-                <div class="font-bold text-gray-900 mr-3">Rs ${lineTotal}</div>
-                <button onclick="billing.removeItem(${index})" class="text-red-400 hover:text-red-600">
-                    <i data-lucide="x-circle" class="w-5 h-5"></i>
-                </button>
-            `;
-            container.appendChild(div);
-        });
-
-        document.getElementById('billing-total-display').textContent = utils.formatCurrency(grandTotal);
-        lucide.createIcons();
-    },
     saveBill: async () => {
         const shopId = parseInt(document.getElementById('billing-shop-select').value);
         if (!shopId) return utils.toast('Please select a shop', 'error');
-        if (appState.cart.length === 0) return utils.toast('Cart is empty', 'error');
 
-        const totalAmount = appState.cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
-        const totalCost = appState.cart.reduce((sum, item) => sum + (item.cost * item.quantity), 0);
+        const selectedItems = appState.billingProducts.filter(p => p.selected && p.quantity > 0);
+        if (selectedItems.length === 0) return utils.toast('No items selected', 'error');
+
+        const totalAmount = selectedItems.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+        const totalCost = selectedItems.reduce((sum, item) => sum + (item.cost * item.quantity), 0);
 
         try {
             const { data: billData, error: billError } = await supaClient.from('bills').insert({
@@ -497,9 +514,9 @@ const billing = {
             if (billError) throw billError;
             const billId = billData.id;
 
-            const billItems = appState.cart.map(item => ({
+            const billItems = selectedItems.map(item => ({
                 billId,
-                productId: item.productId,
+                productId: item.id,
                 quantity: item.quantity,
                 priceAtTime: item.price,
                 costAtTime: item.cost
