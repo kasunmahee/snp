@@ -5,7 +5,55 @@ const supaClient = window.supabase.createClient(supabaseUrl, supabaseKey);
 
 // App State
 const appState = {
-    cart: []
+    cart: [],
+    currentView: 'dashboard',
+    auth: {
+        isLoggedIn: localStorage.getItem('isLoggedIn') === 'true',
+        user: localStorage.getItem('loggedUser') || null
+    }
+};
+
+// Auth Module
+const auth = {
+    login: () => {
+        const user = document.getElementById('login-username').value;
+        const pass = document.getElementById('login-password').value;
+
+        if (user === '123' && pass === '123') {
+            appState.auth.isLoggedIn = true;
+            appState.auth.user = '123';
+            localStorage.setItem('isLoggedIn', 'true');
+            localStorage.setItem('loggedUser', '123');
+            
+            auth.updateUI();
+            utils.toast('Welcome to S&P Product', 'success');
+            dashboard.load();
+        } else {
+            utils.toast('Invalid credentials!', 'error');
+        }
+    },
+    logout: () => {
+        appState.auth.isLoggedIn = false;
+        appState.auth.user = null;
+        localStorage.removeItem('isLoggedIn');
+        localStorage.removeItem('loggedUser');
+        auth.updateUI();
+        utils.toast('Logged out successfully', 'info');
+    },
+    updateUI: () => {
+        const loginView = document.getElementById('view-login');
+        const appView = document.getElementById('authenticated-app');
+        
+        if (appState.auth.isLoggedIn) {
+            loginView.classList.add('hidden');
+            appView.classList.remove('hidden');
+            lucide.createIcons();
+        } else {
+            loginView.classList.remove('hidden');
+            appView.classList.add('hidden');
+            lucide.createIcons();
+        }
+    }
 };
 
 // Router
@@ -79,22 +127,27 @@ const dashboard = {
 
             const { data: bills } = await supaClient.from('bills').select('*').gte('date', startOfMonth.toISOString());
             const totalSales = bills ? bills.reduce((sum, bill) => sum + Number(bill.totalAmount), 0) : 0;
+            const totalCost = bills ? bills.reduce((sum, bill) => sum + Number(bill.totalCost || 0), 0) : 0;
 
             document.getElementById('dash-total-shops').textContent = shopCount || 0;
             document.getElementById('dash-total-sales').textContent = utils.formatCurrency(totalSales);
+            document.getElementById('dash-total-cost').textContent = utils.formatCurrency(totalCost);
 
-            // Recent Transactions
-            const { data: allRecentBills } = await supaClient.from('bills').select('*, shops(*)').order('date', { ascending: false }).limit(50);
+            // Recent Transactions (Filter for Not Paid)
+            const { data: allRecentBills } = await supaClient.from('bills').select('*, shops(*)').order('date', { ascending: false }).limit(100);
             const listEl = document.getElementById('dash-recent-list');
             listEl.innerHTML = '';
 
             let recentBills = [];
             if (allRecentBills) {
-                recentBills = allRecentBills.slice(0, 5); // Take top 5
+                // Only show UNPAID or PARTIAL
+                recentBills = allRecentBills
+                    .filter(b => (b.paidAmount || 0) < (b.totalCost || 0))
+                    .slice(0, 5); 
             }
 
             if (!recentBills || recentBills.length === 0) {
-                listEl.innerHTML = '<div class="text-center py-8 text-gray-400 text-sm">No pending transactions yet</div>';
+                listEl.innerHTML = '<div class="text-center py-8 text-gray-400 text-sm">No pending transactions found</div>';
                 return;
             }
 
@@ -988,6 +1041,9 @@ const historyView = {
             const shopFilterEl = document.getElementById('history-filter-shop');
             const shopFilter = shopFilterEl ? shopFilterEl.value : '';
 
+            const statusFilterEl = document.getElementById('history-filter-status');
+            const statusFilter = statusFilterEl ? statusFilterEl.value : 'all';
+
             const dateStartEl = document.getElementById('history-date-start');
             const dateStart = dateStartEl ? dateStartEl.value : '';
 
@@ -1004,6 +1060,19 @@ const historyView = {
 
                 // Shop Filter
                 if (shopFilter && b.shopId != shopFilter) match = false;
+
+                // Status Filter
+                if (match && statusFilter !== 'all') {
+                    const paid = b.paidAmount || 0;
+                    const total = b.totalCost || 0;
+                    const isPaid = paid >= total;
+                    const isPartial = paid > 0 && paid < total;
+                    const isUnpaid = paid === 0;
+
+                    if (statusFilter === 'paid' && !isPaid) match = false;
+                    if (statusFilter === 'partial' && !isPartial) match = false;
+                    if (statusFilter === 'unpaid' && !isUnpaid) match = false;
+                }
 
                 // Date Filter
                 if (match && (dateStart || dateEnd)) {
@@ -1221,7 +1290,20 @@ window.closeModal = (id) => {
 document.getElementById('history-search')?.addEventListener('input', () => historyView.renderList());
 
 // Initialization
-document.addEventListener('DOMContentLoaded', () => {
-    router.navigate('dashboard');
+document.addEventListener('DOMContentLoaded', async () => {
+    // Initial UI update for Auth
+    auth.updateUI();
+
+    if (appState.auth.isLoggedIn) {
+        await router.navigate('dashboard');
+    }
+    
+    // Setup date defaults
+    const today = new Date().toISOString().split('T')[0];
+    const dateStart = document.getElementById('history-date-start');
+    if (dateStart) dateStart.value = today;
+    const dateEnd = document.getElementById('history-date-end');
+    if (dateEnd) dateEnd.value = today;
+    
     lucide.createIcons();
 });
